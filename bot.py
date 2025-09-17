@@ -1,66 +1,156 @@
-import os,json
+# full_bot_ready_for_railway.py
+import os
+import json
 import textwrap
+import re
+from collections import Counter
+
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes, CallbackQueryHandler
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters,
+    ConversationHandler, ContextTypes, CallbackQueryHandler
+)
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import openai
 from dotenv import load_dotenv
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.pagesizes import letter
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
-import re
+from fpdf import FPDF
 
 # ===== Load env variables =====
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")  # optional
+DEJAVU_FONT_PATH = os.getenv("DEJAVU_FONT_PATH", "DejaVuSans.ttf")  # ensure this file exists in project root
+DEJAVU_FONT_BOLD_PATH = os.getenv("DEJAVU_FONT_BOLD_PATH", "DejaVuSans-Bold.ttf")
+DEJAVU_FONT_ITALIC_PATH = os.getenv("DEJAVU_FONT_ITALIC_PATH", "DejaVuSans-Oblique.ttf")
+DEJAVU_FONT_BOLDITALIC_PATH = os.getenv("DEJAVU_FONT_BOLDITALIC_PATH", "DejaVuSans-BoldOblique.ttf")
+
+
+# validate critical envs early
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN is missing. Set it in .env or Railway variables.")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is missing. Set it in .env or Railway variables.")
+
+# OpenAI client (keeps your usage consistent with earlier code)
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
-creds_dict = json.loads(os.getenv("GOOGLE_CREDS_JSON"))
-# ===== Google Sheets setup =====
+
+# ===== Google Sheets setup (supports env JSON or local file) =====
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+if GOOGLE_CREDS_JSON:
+    creds_dict = json.loads(GOOGLE_CREDS_JSON)
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+else:
+    # fallback to local filename (ensure file is present on the server or in repo - but don't commit secrets)
+    json_path = "trip-planner-472402-76b33256a47b.json"
+    if not os.path.exists(json_path):
+        raise RuntimeError("Google credentials JSON not found. Provide GOOGLE_CREDS_JSON env or upload the JSON file.")
+    creds = ServiceAccountCredentials.from_json_keyfile_name(json_path, scope)
+
 client = gspread.authorize(creds)
-sheet = client.open("Trip Planner").sheet1 
+sheet = client.open("Trip Planner").sheet1
 
 # ===== Conversation states =====
 NAME, DATES, NOT_FEASIBLE, DAYS, PEOPLE, BUDGET, REGION, KIDS, TYPE, CHOICES = range(10)
 
-# ===== Start =====
+# ===== Utility functions =====
+def safe_strip_number_prefix(text: str) -> str:
+    """Remove leading numbering like '1. Place - detail' or '1) Place'."""
+    return re.sub(r'^\s*\d+\s*[\.\)-]*\s*', '', text).strip()
+
+def expand_date_range(date_text: str):
+    """
+    Convert inputs like:
+      "Dec 20–22, Dec 25" -> ["Dec 20","Dec 21","Dec 22","Dec 25"]
+      "Dec 20, Dec 21" -> ["Dec 20","Dec 21"]
+    Non-matching parts are returned as-is (stripped).
+    """
+    if not date_text:
+        return []
+    dates = []
+    parts = [p.strip() for p in re.split(r',|\n', date_text) if p.strip()]
+    for part in parts:
+        # match 'Dec 20-22' or 'Dec 20–22' or 'Dec 20 - 22'
+        m = re.match(r'([A-Za-z]+)\s*(\d+)\s*[–-]\s*(\d+)', part)
+        if m:
+            month, start, end = m.groups()
+            start_i, end_i = int(start), int(end)
+            for d in range(start_i, end_i + 1):
+                dates.append(f"{month} {d}")
+        else:
+            dates.append(part)
+    return dates
+
+def intersect_available_minus_notfeasible(records):
+    """
+    Compute dates where all users are available AND not present in any 'not feasible' lists.
+    Returns sorted list or empty list.
+    """
+    available_sets = []
+    not_feasible_sets = []
+    for r in records:
+        av = set(expand_date_range(r.get('Dates Available', '') or ''))
+        nf = set(expand_date_range(r.get('Dates Not Feasible', '') or ''))
+        if av:
+            available_sets.append(av)
+        else:
+            # if someone didn't provide available dates, treat as empty set -> no common dates
+            available_sets.append(set())
+        not_feasible_sets.append(nf)
+
+    if not available_sets:
+        return []
+
+    # intersection of all available sets (strict: every user must have date)
+    common = set.intersection(*available_sets) if available_sets else set()
+    if not common:
+        return []
+
+    # remove any union of not feasible
+    union_nf = set.union(*not_feasible_sets) if not_feasible_sets else set()
+    final = sorted(common - union_nf)
+    return final
+
+# ===== Handlers: user flow =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Hi! Let's plan the family trip 🎉\n\nWhat's your name?")
     return NAME
 
 async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["Name"] = update.message.text
-    await update.message.reply_text("Which dates are you available? (e.g., Dec 20–25)")
+    context.user_data["Name"] = update.message.text.strip()
+    await update.message.reply_text("Which dates are you available? (e.g., Dec 20–22 or Dec 20, Dec 21)")
     return DATES
 
 async def get_dates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["Dates Available"] = update.message.text
-    await update.message.reply_text("Which dates are NOT feasible for you?")
+    context.user_data["Dates Available"] = update.message.text.strip()
+    await update.message.reply_text("Which dates are NOT feasible for you? (e.g., Dec 24 or Dec 24–25). If none, type 'none'")
     return NOT_FEASIBLE
 
 async def get_not_feasible(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["Dates Not Feasible"] = update.message.text
+    nf = update.message.text.strip()
+    context.user_data["Dates Not Feasible"] = '' if nf.lower() in ('none','no','n/a','na','') else nf
     await update.message.reply_text("How many days can you travel?")
     return DAYS
 
 async def get_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["No. of Days"] = update.message.text
+    context.user_data["No. of Days"] = update.message.text.strip()
     await update.message.reply_text("How many people from your side?")
     return PEOPLE
 
 async def get_people(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["No. of People"] = update.message.text
+    context.user_data["No. of People"] = update.message.text.strip()
     await update.message.reply_text("What is your budget per person? (e.g., 15k or 15000)")
     return BUDGET
 
 async def get_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_input = update.message.text.strip().lower()
     if user_input.endswith("k"):
-        budget_value = int(float(user_input[:-1]) * 1000)
+        try:
+            budget_value = int(float(user_input[:-1]) * 1000)
+        except:
+            await update.message.reply_text("Please enter a valid budget (e.g., 15000 or 15k).")
+            return BUDGET
     else:
         try:
             budget_value = int(user_input)
@@ -69,20 +159,15 @@ async def get_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             return BUDGET
     context.user_data["Budget Per Person"] = budget_value
 
-    # Region selection inline
     keyboard = [
         [InlineKeyboardButton("Kerala", callback_data="Kerala"),
          InlineKeyboardButton("Tamil Nadu", callback_data="Tamil Nadu")],
         [InlineKeyboardButton("Karnataka", callback_data="Karnataka"),
          InlineKeyboardButton("Any", callback_data="Any")]
     ]
-    await update.message.reply_text(
-        "Which region do you prefer?",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await update.message.reply_text("Which region do you prefer?", reply_markup=InlineKeyboardMarkup(keyboard))
     return REGION
 
-# ===== Region, Kid-Friendly, Trip Type Buttons =====
 async def button_region(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -91,9 +176,7 @@ async def button_region(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     keyboard = [[InlineKeyboardButton("Yes", callback_data="Yes"),
                  InlineKeyboardButton("No", callback_data="No")]]
-    await query.message.reply_text(
-        "Do you need it to be kid-friendly?", reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await query.message.reply_text("Do you need it to be kid-friendly?", reply_markup=InlineKeyboardMarkup(keyboard))
     return KIDS
 
 async def button_kids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -105,9 +188,7 @@ async def button_kids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     keyboard = [[InlineKeyboardButton("Hills", callback_data="Hills"),
                  InlineKeyboardButton("Beach", callback_data="Beach"),
                  InlineKeyboardButton("Other", callback_data="Other")]]
-    await query.message.reply_text(
-        "Do you prefer Hills, Beach, or Other?", reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await query.message.reply_text("Do you prefer Hills, Beach, or Other?", reply_markup=InlineKeyboardMarkup(keyboard))
     return TYPE
 
 async def button_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -116,78 +197,222 @@ async def button_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     context.user_data["Type Preference"] = query.data
     await query.edit_message_text(f"Type Preference: {query.data}")
 
-    # Generate AI suggestions
+    # Prepare prompt and call OpenAI
     prompt = textwrap.dedent(f"""
     You are a realistic travel planner AI.
-    User's preferences:
-    - Trip Length: {context.user_data['No. of Days']} days
-    - Number of People: {context.user_data['No. of People']}
-    - Budget Per Person: ₹{context.user_data['Budget Per Person']}
-    - Available Dates: {context.user_data['Dates Available']}
-    - Preferred Region: {context.user_data['Region Preference']}
-    - Kid Friendly: {context.user_data['Kid Friendly']}
-    - Type Preference: {context.user_data['Type Preference']}
 
-    Suggest 5 realistic destinations within 800 km from Chennai with total costs fitting budget, including transport(By self drive own car), accommodation, meals, and local travel.
-    keep the dates and distance strictly. Need accurate distance for the place you suggest from chennai. 
-    Output a numbered list only.
+    User preferences:
+    - Trip Length: {context.user_data.get('No. of Days')}
+    - Number of People: {context.user_data.get('No. of People')}
+    - Budget Per Person: ₹{context.user_data.get('Budget Per Person')}
+    - Available Dates: {context.user_data.get('Dates Available')}
+    - Preferred Region: {context.user_data.get('Region Preference')}
+    - Kid Friendly: {context.user_data.get('Kid Friendly')}
+    - Type Preference: {context.user_data.get('Type Preference')}
+
+    Rules:
+    - Suggest 5 realistic destinations **within 800 km from Chennai**.
+    - For each suggestion include the exact distance (in km) from Chennai (do not hallucinate — if unsure, skip).
+    - Include estimated total costs per person (transport for self-drive, stay, meals, local travel).
+    - Only include destinations whose **total cost per person does not exceed the budget**.
+    - Output a numbered list (1-5). Each line should be: "1. Place — Distance: XXX km — Reason/Cost summary".
+    - Output nothing else.
     """)
-    response = openai_client.chat.completions.create(
-    model="gpt-4",
-    messages=[{"role": "user", "content": prompt}]
-)
-    suggestions = response.choices[0].message.content
-    context.user_data["Suggestions"] = suggestions
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        suggestions = resp.choices[0].message.content.strip()
+    except Exception as e:
+        suggestions = "Sorry, couldn't generate suggestions. Try again later."
 
+    context.user_data["Suggestions"] = suggestions
     await query.message.reply_text(
-        f"Here are some suggestions:\n{suggestions}\n\n"
-        "Reply with numbers of places you like (e.g., 1,3,5) or type your own separated by commas."
+        f"Here are some suggestions:\n{suggestions}\n\nReply with numbers of places you like (e.g., 1,3) or type your own destinations separated by commas."
     )
     return CHOICES
 
-# ===== Get user selected choices =====
 async def get_choices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_reply = update.message.text
     selected = []
-    suggestions = context.user_data.get("Suggestions", "").split("\n")
+    suggestions_text = context.user_data.get("Suggestions", "")
+    # create list of suggestion names by extracting after number and before '—' or '-' or '('
+    suggestion_lines = [ln.strip() for ln in suggestions_text.splitlines() if ln.strip()]
+    suggestion_names = []
+    for ln in suggestion_lines:
+        # remove numbering then take up to '—' or '-' or '('
+        s = re.sub(r'^\s*\d+\s*[\.\)-]*\s*', '', ln)
+        # split by em dash or en dash or hyphen or parentheses
+        s = re.split(r'—|-|\(|;', s)[0].strip()
+        suggestion_names.append(s)
 
     for part in user_reply.split(","):
         part = part.strip()
         if part.isdigit():
             idx = int(part) - 1
-            if 0 <= idx < len(suggestions):
-                selected.append(suggestions[idx].strip("1234567890. "))
+            if 0 <= idx < len(suggestion_names):
+                selected.append(suggestion_names[idx])
         else:
+            # custom place provided by user
             selected.append(part)
-    context.user_data["Selected Destinations"] = ", ".join(selected)
+    context.user_data["Selected Destinations"] = ", ".join([s.strip() for s in selected if s.strip()])
 
-    # Save to Google Sheets
+    # Save to Google Sheets (strings)
     row = [
-        context.user_data.get("Name"),
-        context.user_data.get("Dates Available"),
-        context.user_data.get("Dates Not Feasible"),
-        context.user_data.get("No. of Days"),
-        context.user_data.get("No. of People"),
-        context.user_data.get("Budget Per Person"),
-        context.user_data.get("Region Preference"),
-        context.user_data.get("Kid Friendly"),
-        context.user_data.get("Type Preference"),
-        context.user_data.get("Selected Destinations"),
+        context.user_data.get("Name", ""),
+        context.user_data.get("Dates Available", ""),
+        context.user_data.get("Dates Not Feasible", ""),
+        context.user_data.get("No. of Days", ""),
+        context.user_data.get("No. of People", ""),
+        str(context.user_data.get("Budget Per Person", "")),
+        context.user_data.get("Region Preference", ""),
+        context.user_data.get("Kid Friendly", ""),
+        context.user_data.get("Type Preference", ""),
+        context.user_data.get("Selected Destinations", "")
     ]
-    sheet.append_row(row)
+    try:
+        sheet.append_row(row)
+    except Exception as e:
+        await update.message.reply_text(f"Saved locally but failed to append to Google Sheets: {e}")
+        # still proceed
 
     await update.message.reply_text(
-        f"✅ Got it! Your destinations have been saved: {context.user_data['Selected Destinations']}\n"
+        f"✅ Got it! Your destinations have been saved: {context.user_data.get('Selected Destinations')}\n"
         "You can now use /final to get the optimized group itinerary PDF."
     )
     return ConversationHandler.END
 
-# ===== Cancel =====
+# ===== PDF generation (Unicode) =====
+def parse_itinerary_table_from_ai(text: str):
+    """Return list of rows (each row is list of 6 cells) parsed from a markdown-style table in AI response."""
+    rows = []
+    for line in [ln.strip() for ln in text.splitlines() if ln.strip()]:
+        if "|" in line:
+            cells = [c.strip() for c in line.split("|")[1:-1]]
+            if len(cells) == 6:
+                rows.append(cells)
+    return rows
+
+def generate_group_pdf_itinerary(filename="final_itinerary.pdf"):
+    records = sheet.get_all_records()
+    if not records:
+        return "No responses yet."
+
+    best_dest, best_dates = None, []
+    # compute best destination (most selected)
+    dest_counts = Counter()
+    for r in records:
+        for d in [x.strip() for x in (r.get('Selected Destinations') or "").split(",") if x.strip()]:
+            dest_counts[d] += 1
+    if dest_counts:
+        best_dest = dest_counts.most_common(1)[0][0]
+
+    best_dates = intersect_available_minus_notfeasible(records)
+    if not best_dest or not best_dates:
+        return "Not enough data to generate itinerary (no common feasible dates or no selected destinations)."
+
+    total_people = sum(int(r.get('No. of People') or 0) for r in records)
+    avg_days = int(sum(int(r.get('No. of Days') or 0) for r in records) / len(records))
+    avg_budget = int(sum(int(r.get('Budget Per Person') or 0) for r in records) / len(records))
+
+    prompt = textwrap.dedent(f"""
+    You are a travel planner AI. Generate a final trip itinerary for a group:
+    - Destination: {best_dest}
+    - Dates: {', '.join(best_dates)}
+    - Total People: {total_people}
+    - Trip Length: {avg_days} days
+    - Budget per Person: ₹{avg_budget}
+    - Include kid-friendly activities if any user requested
+    Provide a day-wise itinerary in a table format exactly like:
+
+    | Day | Place/Activity | Meals | Transport | Accommodation | Estimated Cost (₹) |
+    |-----|----------------|-------|----------|---------------|--------------------|
+    | 1   | ...            | ...   | ...      | ...           | 1000               |
+    ...
+
+    After the table, include a short textual summary (1-3 lines).
+
+    Be concise and accurate. Ensure cost estimates are realistic for the region.
+    """)
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1500,
+        )
+        itinerary_text = resp.choices[0].message.content
+    except Exception as e:
+        return f"Error generating itinerary: {e}"
+
+    # parse table rows
+    data_rows = parse_itinerary_table_from_ai(itinerary_text)
+
+    # Create PDF with Unicode font
+    pdf = FPDF()
+    pdf.add_page()
+    # add font (ensure DEJAVU_FONT_PATH exists)
+    if os.path.exists(DEJAVU_FONT_PATH):
+        pdf.add_font("DejaVu", "", DEJAVU_FONT_PATH, uni=True)
+        pdf.add_font("DejaVu", "B", DEJAVU_FONT_BOLD_PATH, uni=True)
+        pdf.add_font("DejaVu", "I", DEJAVU_FONT_ITALIC_PATH, uni=True)  # Italic
+        pdf.add_font("DejaVu", "BI", DEJAVU_FONT_BOLDITALIC_PATH, uni=True)  # Bold Italic
+        title_font = ("DejaVu", "B", 16)
+        header_font = ("DejaVu", "B", 12)
+        body_font = ("DejaVu", "", 11)
+        info_font = ("DejaVu", "I", 10)
+    else:
+        # fallback to built-in font (no Unicode) and replace ₹ with Rs
+        title_font = ("Arial", "B", 16)
+        header_font = ("Arial", "B", 12)
+        body_font = ("Arial", "", 11)
+        info_font = ("Arial", "I", 10)
+        itinerary_text = itinerary_text.replace("₹", "Rs ")
+
+    pdf.set_font(*title_font)
+    pdf.cell(0, 10, f"Final Trip Itinerary — {best_dest}", ln=True, align="C")
+    pdf.ln(6)
+
+    # table header
+    headers = ["Day", "Place/Activity", "Meals", "Transport", "Accommodation", "Estimated Cost (₹)"]
+    col_widths = [15, 60, 30, 30, 40, 25]
+    pdf.set_font(*header_font)
+    for i, h in enumerate(headers):
+        pdf.cell(col_widths[i], 9, h, 1, 0, "C")
+    pdf.ln()
+
+    # rows
+    pdf.set_font(*body_font)
+    if data_rows:
+        for row in data_rows:
+            for i, cell in enumerate(row):
+                text = str(cell)
+                # truncate long cell content to avoid layout issues
+                pdf.cell(col_widths[i], 8, text[:40], 1)
+            pdf.ln()
+    else:
+        pdf.cell(0, 8, "No detailed day-wise table parsed from AI output.", 1, ln=True)
+
+    pdf.ln(6)
+    # summary lines (non-table lines)
+    summary_lines = [ln for ln in itinerary_text.splitlines() if '|' not in ln and ln.strip()]
+    pdf.set_font(*body_font)
+    for ln in summary_lines:
+        pdf.multi_cell(0, 7, ln)
+
+    pdf.ln(4)
+    pdf.set_font(*info_font)
+    pdf.multi_cell(0, 6, f"Dates: {', '.join(best_dates)} | Destination: {best_dest} | Total People: {total_people} | Avg Budget/Person: ₹{avg_budget}")
+
+    # save file
+    pdf.output(filename)
+    return filename
+
+# ===== Commands =====
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("❌ Cancelled. Start again with /start.")
     return ConversationHandler.END
 
-# ===== Hi command =====
 async def hi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Available commands:\n"
@@ -197,140 +422,28 @@ async def hi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/cancel - Cancel the current trip planning"
     )
 
-# ===== Summary =====
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = sheet.get_all_records()
     if not data:
         await update.message.reply_text("No responses yet.")
         return
-    itinerary_text = "Trip Summary:\n\n"
+    s = "Trip Summary:\n\n"
     for d in data:
-        itinerary_text += f"{d['Name']}: {d['Selected Destinations']}\n"
-    await update.message.reply_text(itinerary_text)
+        s += f"{d.get('Name','')}: {d.get('Selected Destinations','')}\n"
+    await update.message.reply_text(s)
 
-
-
-
-def expand_date_range(date_text):
-    """
-    Converts a string like 'Dec 20–22' to ['Dec 20', 'Dec 21', 'Dec 22'].
-    Supports multiple ranges separated by commas.
-    """
-    dates = []
-    parts = [p.strip() for p in date_text.split(",")]
-    for part in parts:
-        match = re.match(r'(\w+)\s*(\d+)[–-](\d+)', part)
-        if match:
-            month, start_day, end_day = match.groups()
-            start_day = int(start_day)
-            end_day = int(end_day)
-            for day in range(start_day, end_day + 1):
-                dates.append(f"{month} {day}")
-        else:
-            dates.append(part)
-    return dates
-
-def get_best_destination_and_dates():
-    records = sheet.get_all_records()
-    if not records:
-        return None, None
-
-    # Count destinations
-    dest_counts = {}
-    available_sets = []
-    not_feasible_sets = []
-
-    for r in records:
-        # Clean destinations
-        destinations = [d.strip() for d in r['Selected Destinations'].split(",") if d.strip()]
-        for d in destinations:
-            dest_counts[d] = dest_counts.get(d, 0) + 1
-
-        # Expand available and not-feasible dates
-        available_sets.append(set(expand_date_range(r.get('Dates Available', ''))))
-        not_feasible_sets.append(set(expand_date_range(r.get('Dates Not Feasible', ''))))
-
-    # Best destination: most selected
-    best_dest = max(dest_counts, key=dest_counts.get) if dest_counts else None
-
-    # Compute final valid dates
-    if not available_sets:
-        best_dates = None
-    else:
-        common_dates = set.intersection(*available_sets)  # dates everyone is available
-        if not_feasible_sets:
-            all_not_feasible = set.union(*not_feasible_sets)
-            common_dates = common_dates - all_not_feasible  # remove not-feasible dates
-        best_dates = sorted(common_dates) if common_dates else None
-
-    return best_dest, best_dates
-
-
-# ===== Generate Group PDF Itinerary =====
-def generate_group_pdf_itinerary(filename="final_itinerary.pdf"):
-    best_dest, best_dates = get_best_destination_and_dates()
-    if not best_dest or not best_dates:
-        return "Not enough data to generate itinerary."
-
-    records = sheet.get_all_records()
-    total_people = sum(int(r['No. of People']) for r in records)
-    avg_days = int(sum(int(r['No. of Days']) for r in records)/len(records))
-    avg_budget = int(sum(int(r['Budget Per Person']) for r in records)/len(records))
-
-    prompt = textwrap.dedent(f"""
-    You are a travel planner AI. Generate a final trip itinerary for a group:
-    - Destination: {best_dest}
-    - Dates: {', '.join(best_dates)}
-    - Total People: {total_people}
-    - Average Trip Length: {avg_days} days
-    - Average Budget per Person: ₹{avg_budget}
-    - Include kid-friendly activities if requested by any participant
-    Provide a detailed day-wise itinerary in tabular format:
-    | Day | Place/Activity | Meals | Transport | Accommodation | Estimated Cost (₹) |
-    Also include a brief summary at the end.
-    """)
-    response = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    itinerary_text = response.choices[0].message.content
-
-    # Create PDF
-    doc = SimpleDocTemplate(filename, pagesize=letter)
-    elements = []
-    styles = getSampleStyleSheet()
-    elements.append(Paragraph(f"📌 Final Trip Itinerary for {best_dest}", styles['Title']))
-    elements.append(Spacer(1, 12))
-
-    lines = [line.strip() for line in itinerary_text.split("\n") if line.strip()]
-    data = []
-    for line in lines:
-        if "|" in line:
-            row = [cell.strip() for cell in line.split("|")[1:-1]]
-            data.append(row)
-    if data:
-        table = Table([["Day","Place/Activity","Meals","Transport","Accommodation","Estimated Cost (₹)"]] + data, hAlign='LEFT')
-        table.setStyle(TableStyle([
-            ('BACKGROUND',(0,0),(-1,0),colors.HexColor('#4CAF50')),
-            ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
-            ('ALIGN',(0,0),(-1,-1),'CENTER'),
-            ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
-            ('GRID',(0,0),(-1,-1),1,colors.black),
-            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.whitesmoke, colors.lightgrey])
-        ]))
-        elements.append(table)
-    elements.append(Spacer(1, 12))
-    elements.append(Paragraph(f"Dates: {', '.join(best_dates)} | Destination: {best_dest} | Total People: {total_people} | Avg Budget/Person: ₹{avg_budget}", styles['Normal']))
-    doc.build(elements)
-    return filename
-
-# ===== /final command =====
 async def final_itinerary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    filename = generate_group_pdf_itinerary()
-    if filename.endswith(".pdf"):
-        await update.message.reply_document(document=open(filename, "rb"))
+    await update.message.reply_text("Generating final itinerary PDF — please wait...")
+    result = generate_group_pdf_itinerary()
+    if result and result.endswith(".pdf") and os.path.exists(result):
+        with open(result, "rb") as f:
+            await update.message.reply_document(document=f)
+        try:
+            os.remove(result)
+        except Exception:
+            pass
     else:
-        await update.message.reply_text(filename)
+        await update.message.reply_text(str(result))
 
 # ===== Main =====
 def main():
@@ -345,16 +458,19 @@ def main():
             DAYS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_days)],
             PEOPLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_people)],
             BUDGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_budget)],
-            REGION: [CallbackQueryHandler(button_region)],
-            KIDS: [CallbackQueryHandler(button_kids)],
-            TYPE: [CallbackQueryHandler(button_type)],
+            REGION: [CallbackQueryHandler(button_region, pattern="^(Kerala|Tamil Nadu|Karnataka|Any)$")],
+            KIDS: [CallbackQueryHandler(button_kids, pattern="^(Yes|No)$")],
+            TYPE: [CallbackQueryHandler(button_type, pattern="^(Hills|Beach|Other)$")],
             CHOICES: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_choices)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
 
     app.add_handler(conv_handler)
-    app.add_handler(MessageHandler(filters.Regex(re.compile(r"^(hi|hello)$", re.I)), hi))
+    # respond to /hi command and plain "hi"/"hello"
+    app.add_handler(CommandHandler("hi", hi))
+    app.add_handler(MessageHandler(filters.Regex(re.compile(r"^\s*(hi|hello)\s*$", re.I)), hi))
     app.add_handler(CommandHandler("summary", summary))
     app.add_handler(CommandHandler("final", final_itinerary))
 
