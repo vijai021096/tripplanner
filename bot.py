@@ -59,7 +59,7 @@ def safe_strip_number_prefix(text: str) -> str:
     """Remove leading numbering like '1. Place - detail' or '1) Place'."""
     return re.sub(r'^\s*\d+\s*[\.\)-]*\s*', '', text).strip()
 
-def expand_date_range(date_text: str):
+def expand_date_range(date_text):
     """
     Convert inputs like:
       "Dec 20–22, Dec 25" -> ["Dec 20","Dec 21","Dec 22","Dec 25"]
@@ -68,6 +68,10 @@ def expand_date_range(date_text: str):
     """
     if not date_text:
         return []
+    
+    # Ensure it is string
+    date_text = str(date_text)
+    
     dates = []
     parts = [p.strip() for p in re.split(r',|\n', date_text) if p.strip()]
     for part in parts:
@@ -82,6 +86,7 @@ def expand_date_range(date_text: str):
             dates.append(part)
     return dates
 
+
 def intersect_available_minus_notfeasible(records):
     """
     Compute dates where all users are available AND not present in any 'not feasible' lists.
@@ -89,28 +94,31 @@ def intersect_available_minus_notfeasible(records):
     """
     available_sets = []
     not_feasible_sets = []
+
     for r in records:
-        av = set(expand_date_range(r.get('Dates Available', '') or ''))
-        nf = set(expand_date_range(r.get('Dates Not Feasible', '') or ''))
-        if av:
-            available_sets.append(av)
-        else:
-            # if someone didn't provide available dates, treat as empty set -> no common dates
-            available_sets.append(set())
-        not_feasible_sets.append(nf)
+        # Convert to string safely
+        av_str = str(r.get('Dates Available', '') or '').strip()
+        nf_str = str(r.get('Dates Not Feasible', '') or '').strip()
+
+        av_set = set(expand_date_range(av_str)) if av_str else set()
+        nf_set = set(expand_date_range(nf_str)) if nf_str else set()
+
+        available_sets.append(av_set)
+        not_feasible_sets.append(nf_set)
 
     if not available_sets:
         return []
 
-    # intersection of all available sets (strict: every user must have date)
+    # Intersection of all available sets (strict: every user must have date)
     common = set.intersection(*available_sets) if available_sets else set()
     if not common:
         return []
 
-    # remove any union of not feasible
+    # Remove any union of not feasible dates
     union_nf = set.union(*not_feasible_sets) if not_feasible_sets else set()
     final = sorted(common - union_nf)
     return final
+
 
 # ===== Handlers: user flow =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -294,6 +302,17 @@ def parse_itinerary_table_from_ai(text: str):
                 rows.append(cells)
     return rows
 
+# ===== PDF generation (Unicode) =====
+def parse_itinerary_table_from_ai(text: str):
+    """Return list of rows (each row is list of 6 cells) parsed from a markdown-style table in AI response."""
+    rows = []
+    for line in [ln.strip() for ln in text.splitlines() if ln.strip()]:
+        if "|" in line:
+            cells = [c.strip() for c in line.split("|")[1:-1]]
+            if len(cells) == 6:
+                rows.append(cells)
+    return rows
+
 def generate_group_pdf_itinerary(filename="final_itinerary.pdf"):
     records = sheet.get_all_records()
     if not records:
@@ -317,24 +336,37 @@ def generate_group_pdf_itinerary(filename="final_itinerary.pdf"):
     avg_budget = int(sum(int(r.get('Budget Per Person') or 0) for r in records) / len(records))
 
     prompt = textwrap.dedent(f"""
-    You are a travel planner AI. Generate a final trip itinerary for a group:
-    - Destination: {best_dest}
-    - Dates: {', '.join(best_dates)}
-    - Total People: {total_people}
-    - Trip Length: {avg_days} days
-    - Budget per Person: ₹{avg_budget}
-    - Include kid-friendly activities if any user requested
-    Provide a day-wise itinerary in a table format exactly like:
+You are a realistic travel planner AI.
 
-    | Day | Place/Activity | Meals | Transport | Accommodation | Estimated Cost (₹) |
-    |-----|----------------|-------|----------|---------------|--------------------|
-    | 1   | ...            | ...   | ...      | ...           | 1000               |
-    ...
+Group trip info:
+- Total trip length: {avg_days} days
+- Total people: {total_people}
+- Budget per person: ₹{avg_budget}
+- Available dates: {', '.join(best_dates)}
+- User-selected destinations (popularity considered): {', '.join([d for d, _ in dest_counts.most_common()])}
+- Kid-friendly if requested
 
-    After the table, include a short textual summary (1-3 lines).
+Instructions:
+1. Each destination has an ideal stay:
+   Varkala: 2 days
+   Kodaikanal: 3 days
+   Munnar: 3 days
+   Ooty: 3 days
+   Mahabalipuram: 1 day
+   Coorg: 3 days
+   Yelagiri: 1 day
+2. Allocate days per destination according to ideal duration and total trip length and travel time also from chennai and return to chennai by car.
+3. If the top destination’s ideal duration is shorter than the trip, fill remaining days with next most popular destinations that are feasible and close by, minimizing travel.
+4. Provide a **day-wise itinerary in a table**:
 
-    Be concise and accurate. Ensure cost estimates are realistic for the region.
-    """)
+| Day | Place/Activity | Meals | Transport | Accommodation | Estimated Cost (₹) |
+|-----|----------------|-------|----------|---------------|--------------------|
+
+5. Ensure realistic cost estimates and travel feasibility.
+6. Be concise, do not exceed the total trip length.
+7. Output nothing else.
+"""
+)
     try:
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
