@@ -356,14 +356,14 @@ Instructions:
    Coorg: 3 days
    Yelagiri: 1 day
 2. Allocate days per destination according to ideal duration and total trip length and travel time also from chennai and return to chennai by car.
-3. If the top destination’s ideal duration is shorter than the trip, fill remaining days with next most popular destinations that are feasible and close by, minimizing travel.
+3. If the top destination’s ideal duration is shorter than the trip, fill remaining days with next most popular destinations that are feasible and close by, minimizing travel to the maximum extent.
 4. Provide a **day-wise itinerary in a table**:
 
 | Day | Place/Activity | Meals | Transport | Accommodation | Estimated Cost (₹) |
 |-----|----------------|-------|----------|---------------|--------------------|
 
-5. Ensure realistic cost estimates and travel feasibility.
-6. Be concise, do not exceed the total trip length.
+5. Ensure realistic cost estimates and travel feasibility and include fuel charges as well.
+6. Be concise, do not exceed the total trip length and budget and dont make tavel long and continous.
 7. Output nothing else.
 """
 )
